@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/quanghona/agent_design_pattern.git"
+Repository = "https://github.com/quanghona/aap_transformers.git"
 
 
 [build-system]
