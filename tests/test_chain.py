@@ -12,14 +12,16 @@ import io
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pytest
+import soundfile as sf
 import torch
 from aap_core.types import AgentMessage, ContentType, MediaReference
 from PIL import Image
 
 import aap_transformers.chain as chain_module
 from aap_transformers.chain import ChatCausalMultiTurnsChain
-from aap_transformers.utils import media_ref_to_image_part
+from aap_transformers.utils import media_ref_to_audio_part, media_ref_to_image_part
 
 
 def png_bytes(color: str = "red", size: Tuple[int, int] = (4, 4)) -> bytes:
@@ -28,8 +30,20 @@ def png_bytes(color: str = "red", size: Tuple[int, int] = (4, 4)) -> bytes:
     return buf.getvalue()
 
 
+def wav_bytes(sample_rate: int = 16_000, seconds: float = 0.05) -> bytes:
+    buf = io.BytesIO()
+    n = int(sample_rate * seconds)
+    t = np.linspace(0, seconds, n, endpoint=False)
+    sf.write(
+        buf, np.sin(2 * np.pi * 440 * t).astype("float32"), sample_rate, format="WAV"
+    )
+    return buf.getvalue()
+
+
 PNG_DATA = png_bytes()
 PNG_B64 = base64.b64encode(PNG_DATA).decode("ascii")
+WAV_DATA = wav_bytes()
+WAV_B64 = base64.b64encode(WAV_DATA).decode("ascii")
 
 
 class FakeInputs(dict):
@@ -64,13 +78,32 @@ class FakeTokenizer:
         return ["answer"]
 
 
-class FakeProcessor:
-    """Stand-in for AutoProcessor; carries an image_processor only when vision."""
+class FakeFeatureExtractor:
+    """Stand-in for a feature extractor; its presence marks an audio pipeline."""
 
-    def __init__(self, tokenizer: Optional[FakeTokenizer] = None, vision: bool = True):
+    def __init__(self, sampling_rate: int = 16_000):
+        self.sampling_rate = sampling_rate
+
+
+class FakeProcessor:
+    """Stand-in for AutoProcessor; carries each pipeline only when capable.
+
+    image_processor marks vision, feature_extractor marks audio - exactly the
+    attributes _resolve_capabilities probes on a real processor.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Optional[FakeTokenizer] = None,
+        vision: bool = True,
+        audio: bool = False,
+        sampling_rate: int = 16_000,
+    ):
         self.tokenizer = tokenizer if tokenizer is not None else FakeTokenizer()
         if vision:
             self.image_processor = object()
+        if audio:
+            self.feature_extractor = FakeFeatureExtractor(sampling_rate)
         self.calls: List[Tuple[List[Dict[str, Any]], Dict[str, Any]]] = []
 
     def apply_chat_template(self, conversation, **kwargs):
@@ -143,6 +176,11 @@ def image_refs(content: Any) -> List[Dict[str, Any]]:
     return [part for part in content if part.get("type") == "image"]
 
 
+def audio_refs(content: Any) -> List[Dict[str, Any]]:
+    assert isinstance(content, list), f"expected content parts, got {content!r}"
+    return [part for part in content if part.get("type") == "audio"]
+
+
 class TestMediaRefToImagePart:
     def test_url_ref_becomes_url_part(self):
         ref: MediaReference = {
@@ -190,6 +228,75 @@ class TestMediaRefToImagePart:
         }
         with pytest.raises(ValueError, match="only image refs"):
             media_ref_to_image_part(ref)
+
+
+class TestMediaRefToAudioPart:
+    def test_url_ref_becomes_url_part(self):
+        ref: MediaReference = {
+            "content_type": "audio",
+            "kind": "url",
+            "value": "https://example.com/sound.wav",
+            "mime_type": "audio/wav",
+        }
+        assert media_ref_to_audio_part(ref) == {
+            "type": "audio",
+            "url": "https://example.com/sound.wav",
+        }
+
+    def test_base64_ref_decodes_to_float32_array(self):
+        ref: MediaReference = {
+            "content_type": "audio",
+            "kind": "base64",
+            "value": WAV_B64,
+            "mime_type": "audio/wav",
+        }
+        part = media_ref_to_audio_part(ref)
+        assert part["type"] == "audio"
+        assert part["audio"].dtype == np.float32
+        assert part["audio"].ndim == 1
+
+    def test_base64_ref_is_resampled_to_target_rate(self):
+        ref: MediaReference = {
+            "content_type": "audio",
+            "kind": "base64",
+            "value": base64.b64encode(
+                wav_bytes(sample_rate=48_000, seconds=1.0)
+            ).decode("ascii"),
+            "mime_type": "audio/wav",
+        }
+        part = media_ref_to_audio_part(ref, sampling_rate=16_000)
+        assert len(part["audio"]) == 16_000
+
+    def test_stereo_is_downmixed_to_mono(self):
+        buf = io.BytesIO()
+        sf.write(buf, np.zeros((16_000, 2), dtype="float32"), 16_000, format="WAV")
+        ref: MediaReference = {
+            "content_type": "audio",
+            "kind": "base64",
+            "value": base64.b64encode(buf.getvalue()).decode("ascii"),
+            "mime_type": "audio/wav",
+        }
+        assert media_ref_to_audio_part(ref)["audio"].ndim == 1
+
+    def test_corrupt_base64_raises_value_error(self):
+        ref: MediaReference = {
+            "content_type": "audio",
+            "kind": "base64",
+            "value": base64.b64encode(b"not audio").decode("ascii"),
+            "mime_type": "audio/wav",
+        }
+        with pytest.raises(ValueError, match="could not be decoded"):
+            media_ref_to_audio_part(ref)
+
+    def test_non_audio_ref_is_refused(self):
+        ref: MediaReference = {
+            "content_type": "image",
+            "kind": "url",
+            "value": "https://example.com/cat.png",
+            "mime_type": "image/png",
+        }
+        with pytest.raises(ValueError, match="only audio refs"):
+            media_ref_to_audio_part(ref)
 
 
 class TestPrepareConversationTextOnly:
@@ -301,6 +408,92 @@ class TestPrepareConversationWithImages:
             chain._prepare_conversation(msg)
 
 
+class TestPrepareConversationWithAudio:
+    """Audio media must become native content parts on the current user message."""
+
+    def audio_chain(self, **kwargs) -> ChatCausalMultiTurnsChain:
+        return make_chain(formatter=FakeProcessor(vision=False, audio=True), **kwargs)
+
+    def test_url_audio_becomes_content_parts(self):
+        chain = self.audio_chain()
+        msg = AgentMessage(
+            query="what do you hear?",
+            query_media=[("audio", "https://example.com/sound.wav")],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content[0] == {"type": "text", "text": "what do you hear?"}
+        assert content[1] == {
+            "type": "audio",
+            "url": "https://example.com/sound.wav",
+        }
+
+    def test_base64_audio_becomes_array_part(self):
+        chain = self.audio_chain()
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", f"data:audio/wav;base64,{WAV_B64}")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content[1]["type"] == "audio"
+        assert isinstance(content[1]["audio"], np.ndarray)
+
+    def test_local_path_audio_becomes_array_part(self, tmp_path):
+        f = tmp_path / "sound.wav"
+        f.write_bytes(WAV_DATA)
+        chain = self.audio_chain()
+        msg = AgentMessage(query="hear this?", query_media=[("audio", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content[1]["type"] == "audio"
+        assert isinstance(content[1]["audio"], np.ndarray)
+
+    def test_extractor_sampling_rate_is_used(self):
+        chain = make_chain(
+            formatter=FakeProcessor(vision=False, audio=True, sampling_rate=24_000)
+        )
+        msg = AgentMessage(
+            query="q",
+            query_media=[("audio", f"data:audio/wav;base64,{WAV_B64}")],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert len(content[1]["audio"]) == int(0.05 * 24_000)
+
+    def test_multiple_audios_preserve_order(self):
+        chain = self.audio_chain()
+        msg = AgentMessage(
+            query="two?",
+            query_media=[
+                ("audio", "https://example.com/a.wav"),
+                ("audio", "https://example.com/b.wav"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert [part["url"] for part in audio_refs(content)] == [
+            "https://example.com/a.wav",
+            "https://example.com/b.wav",
+        ]
+
+    def test_images_precede_audios_in_content(self):
+        chain = make_chain(formatter=FakeProcessor(vision=True, audio=True))
+        msg = AgentMessage(
+            query="both?",
+            query_media=[
+                ("audio", "https://example.com/sound.wav"),
+                ("image", "https://example.com/cat.png"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert [part["type"] for part in content] == ["text", "image", "audio"]
+
+    def test_media_never_leaks_into_prompt_text(self):
+        chain = self.audio_chain()
+        msg = AgentMessage(
+            query="listen",
+            query_media=[("audio", "https://example.com/sound.wav")],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        text_parts = [part["text"] for part in content if part["type"] == "text"]
+        assert text_parts == ["listen"], "media repr leaked into the prompt template"
+
+
 class TestGenerateResponse:
     def test_tokenizer_path_unchanged_for_text_only_processor(self):
         tokenizer = FakeTokenizer()
@@ -333,6 +526,21 @@ class TestGenerateResponse:
         assert sent_kwargs["return_dict"] is True
         assert image_refs(sent_conversation[1]["content"])
 
+    def test_audio_only_processor_routes_to_processor_not_tokenizer(self):
+        """The feature pipeline needs the processor exactly like the pixel one."""
+        tokenizer = FakeTokenizer()
+        processor = FakeProcessor(tokenizer=tokenizer, vision=False, audio=True)
+        chain = make_chain(formatter=processor)
+        conversation = chain._prepare_conversation(
+            AgentMessage(
+                query="q", query_media=[("audio", "https://example.com/a.wav")]
+            )
+        )
+        chain._generate_response(conversation)
+        assert len(processor.calls) == 1
+        assert tokenizer.calls == []
+        assert audio_refs(processor.calls[0][0][1]["content"])
+
     def test_tool_call_detection(self):
         class ToolCallingModel(FakeModel):
             def generate(self, **kwargs):
@@ -353,11 +561,19 @@ class TestGenerateResponse:
 class TestCapabilityDetection:
     def test_vision_processor_is_decisive_true(self):
         chain = make_chain(formatter=FakeProcessor())
-        assert chain.detect_capabilities() == {"image": True}
+        assert chain.detect_capabilities() == {"image": True, "audio": False}
 
     def test_processor_without_image_processor_is_decisive_false(self):
         chain = make_chain(formatter=FakeProcessor(vision=False))
-        assert chain.detect_capabilities() == {"image": False}
+        assert chain.detect_capabilities() == {"image": False, "audio": False}
+
+    def test_audio_processor_is_decisive_per_modality(self):
+        chain = make_chain(formatter=FakeProcessor(vision=False, audio=True))
+        assert chain.detect_capabilities() == {"image": False, "audio": True}
+
+    def test_omni_processor_reports_both_true(self):
+        chain = make_chain(formatter=FakeProcessor(vision=True, audio=True))
+        assert chain.detect_capabilities() == {"image": True, "audio": True}
 
     def test_plain_tokenizer_without_repo_id_is_undecidable(self):
         chain = make_chain(formatter=FakeTokenizer(name_or_path="local-weights"))
@@ -369,6 +585,16 @@ class TestCapabilityDetection:
             formatter=FakeTokenizer(name_or_path="Qwen/Qwen2.5-7B-Instruct")
         )
         assert chain.detect_capabilities() == {"image": False}
+
+    def test_hf_card_decides_audio_without_processor(self, hf):
+        """No processor loaded: the model card's task tags fill the audio gap."""
+        hf.results["org/audio-repo"] = {"image": False, "audio": True}
+        chain = make_chain(formatter=FakeTokenizer(name_or_path="org/audio-repo"))
+        msg = AgentMessage(
+            query="q", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert len(audio_refs(content)) == 1
 
     def test_provider_name_never_hits_hf(self, hf):
         chain = make_chain(formatter=FakeTokenizer(name_or_path="gemma3:12b"))
@@ -388,7 +614,7 @@ class TestCapabilityDetection:
         chain = make_chain(
             formatter=FakeProcessor(tokenizer=FakeTokenizer(name_or_path="org/repo"))
         )
-        assert chain.detect_capabilities() == {"image": True}
+        assert chain.detect_capabilities() == {"image": True, "audio": False}
         assert hf.calls == []
 
     def test_capabilities_are_cached(self, hf):
@@ -412,7 +638,7 @@ class TestCapabilityDetection:
         formatter, model = chain.model
         chain.model = (formatter, model)
         assert chain._processor is processor
-        assert chain.detect_capabilities() == {"image": True}
+        assert chain.detect_capabilities() == {"image": True, "audio": False}
 
 
 class TestMediaGate:
@@ -456,6 +682,38 @@ class TestMediaGate:
         content = user_message_of(chain._prepare_conversation(msg))["content"]
         assert len(image_refs(content)) == 1
 
+    def test_incapable_model_drops_audio_with_warning(self, caplog):
+        chain = make_chain(formatter=FakeProcessor())  # vision-only: audio False
+        msg = AgentMessage(
+            query="sound?", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content == "sound?"
+        assert "does not support audio" in caplog.text
+
+    def test_disabled_policy_overrides_audio_processor(self):
+        chain = make_chain(
+            formatter=FakeProcessor(vision=False, audio=True),
+            media_support={"audio": "disabled"},
+        )
+        msg = AgentMessage(
+            query="sound?", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content == "sound?"
+
+    def test_enabled_policy_overrides_decisive_audio_negative(self):
+        chain = make_chain(
+            formatter=FakeProcessor(),  # vision processor: audio decisively False
+            media_support={"audio": "enabled"},
+        )
+        msg = AgentMessage(
+            query="sound?", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert len(audio_refs(content)) == 1
+
 
 class TestInvokeEndToEnd:
     def test_invoke_with_image_delivers_parts_and_records_usage(self):
@@ -484,6 +742,37 @@ class TestInvokeEndToEnd:
             result = chain(msg)
         assert result.responses == [(chain.name, "answer")]
         assert not image_refs_of_any_call(processor)
+
+    def test_invoke_with_audio_delivers_parts_and_records_usage(self):
+        processor = FakeProcessor(vision=False, audio=True)
+        model = FakeModel()
+        chain = make_chain(formatter=processor, model=model)
+        msg = AgentMessage(
+            query="what do you hear?",
+            query_media=[("audio", "https://example.com/sound.wav")],
+        )
+        result = chain(msg)
+        assert result.responses == [(chain.name, "answer")]
+        assert result.execution_result == "success"
+        assert len(processor.calls) == 1
+        assert audio_refs(processor.calls[0][0][1]["content"])
+
+    def test_invoke_audio_only_model_drops_image_keeps_audio(self, caplog):
+        processor = FakeProcessor(vision=False, audio=True)
+        chain = make_chain(formatter=processor)
+        msg = AgentMessage(
+            query="mixed?",
+            query_media=[
+                ("image", "https://example.com/cat.png"),
+                ("audio", "https://example.com/sound.wav"),
+            ],
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            result = chain(msg)
+        assert result.execution_result == "success"
+        content = processor.calls[0][0][1]["content"]
+        assert not image_refs(content)
+        assert len(audio_refs(content)) == 1
 
     def test_query_media_untouched_on_message(self):
         chain = make_chain()

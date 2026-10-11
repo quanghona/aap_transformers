@@ -16,6 +16,11 @@ dependencies = [
     "triton>=3.6.0",
     "wandb>=0.27.0",
     "pillow>=10.0",
+    # Audio input: base64 refs are decoded/resampled at our layer because
+    # transformers' own loaders (librosa/torchcodec) are optional extras.
+    # These two are what transformers.audio_utils itself uses internally.
+    "soundfile>=0.12.1",
+    "soxr>=0.4",
 ]
 classifiers = [
     "Programming Language :: Python :: 3.10",
