@@ -9,8 +9,6 @@ from aap_core.chain import BaseCausalMultiTurnsChain
 from aap_core.types import AgentMessage, ContentType, TokenUsage
 from aap_core.utils import extract_repo_id, huggingface_capabilities
 from pydantic import Field, PrivateAttr
-from typing_extensions import TypedDict
-
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -18,8 +16,14 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
+from typing_extensions import TypedDict
 
-from aap_transformers.utils import media_ref_to_audio_part, media_ref_to_image_part
+from aap_transformers.utils import (
+    DEFAULT_NUM_FRAMES,
+    media_ref_to_audio_part,
+    media_ref_to_image_part,
+    media_ref_to_video_part,
+)
 
 
 class TransformersChainMessage(TypedDict):
@@ -58,12 +62,13 @@ class ChatCausalMultiTurnsChain(
         For identifiers, AutoProcessor is tried first: when it loads and carries
         an image_processor, the vision model class and the processor are used,
         because only the processor expands image parts into pixel inputs. A
-        processor carrying only a feature_extractor (audio chat models such as
-        Qwen2-Audio, whose class lives solely in the multimodal mapping) loads
-        through AutoModelForMultimodalLM for the same reason: only the
-        processor expands audio parts into features. Every other case keeps
-        the previous tokenizer-only path unchanged. A processor that loads
-        without either is still retained as decisive negative evidence for
+        processor carrying only a feature_extractor or video_processor (audio
+        chat models such as Qwen2-Audio, and omni models whose class lives
+        solely in the multimodal mapping) loads through
+        AutoModelForMultimodalLM for the same reason: only the processor
+        expands audio/video parts into features. Every other case keeps the
+        previous tokenizer-only path unchanged. A processor that loads without
+        any of them is still retained as decisive negative evidence for
         capability detection.
         """
         if isinstance(model, (str, os.PathLike)):
@@ -81,10 +86,14 @@ class ChatCausalMultiTurnsChain(
                 self._model = AutoModelForImageTextToText.from_pretrained(
                     self._model_id, device_map=self.device
                 )
-            elif processor is not None and hasattr(processor, "feature_extractor"):
-                # Audio chat models (Qwen2-Audio, Voxtral, ...): their classes
-                # live only in the multimodal mapping, and only the processor
-                # expands audio parts into features, as with pixels above.
+            elif processor is not None and (
+                hasattr(processor, "feature_extractor")
+                or hasattr(processor, "video_processor")
+            ):
+                # Audio chat models (Qwen2-Audio, Voxtral, ...) and omni models
+                # whose class lives only in the multimodal mapping: only the
+                # processor expands audio/video parts into features, as with
+                # pixels above.
                 self._tokenizer = processor.tokenizer
                 self._model = AutoModelForMultimodalLM.from_pretrained(
                     self._model_id, device_map=self.device
@@ -140,6 +149,7 @@ class ChatCausalMultiTurnsChain(
             return {
                 "image": hasattr(self._processor, "image_processor"),
                 "audio": hasattr(self._processor, "feature_extractor"),
+                "video": hasattr(self._processor, "video_processor"),
             }
         repo_id = extract_repo_id(self._identifier_candidates())
         if repo_id is not None:
@@ -181,14 +191,19 @@ class ChatCausalMultiTurnsChain(
         user_prompt = self.user_prompt_template.format(**message.format_kwargs())
         images = self._image_parts(message)
         audios = self._audio_parts(message)
+        videos = self._video_parts(message)
         user_content: str | List[Dict[str, Any]] = user_prompt
-        if images or audios:
+        if images or audios or videos:
             user_content = [
                 {"type": "text", "text": user_prompt},
                 *[media_ref_to_image_part(ref) for ref in images],
                 *[
                     media_ref_to_audio_part(ref, self._audio_sampling_rate)
                     for ref in audios
+                ],
+                *[
+                    media_ref_to_video_part(ref, self._video_num_frames)
+                    for ref in videos
                 ],
             ]
         conversation: List[TransformersChainMessage] = [
@@ -229,6 +244,7 @@ class ChatCausalMultiTurnsChain(
             and (
                 hasattr(self._processor, "image_processor")
                 or hasattr(self._processor, "feature_extractor")
+                or hasattr(self._processor, "video_processor")
             )
             else self._tokenizer
         )
@@ -318,6 +334,19 @@ class ChatCausalMultiTurnsChain(
         """
         extractor = getattr(self._processor, "feature_extractor", None)
         return getattr(extractor, "sampling_rate", 16_000)
+
+    @property
+    def _video_num_frames(self) -> int:
+        """The frame budget the loaded model expects a video at.
+
+        transformers' processor samples string videos to its video
+        processor's num_frames, but array inputs skip that sampling and are
+        used as delivered, so media_ref_to_video_part must apply the same
+        budget here. Falls back to the library class default when no video
+        processor is loaded.
+        """
+        video_processor = getattr(self._processor, "video_processor", None)
+        return getattr(video_processor, "num_frames", None) or DEFAULT_NUM_FRAMES
 
     @property
     def tools(self) -> List[Callable]:

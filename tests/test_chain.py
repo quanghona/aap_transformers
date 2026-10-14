@@ -10,8 +10,11 @@ autouse fixture so detection is deterministic offline.
 import base64
 import io
 import logging
+import os
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
@@ -20,8 +23,14 @@ from aap_core.types import AgentMessage, ContentType, MediaReference
 from PIL import Image
 
 import aap_transformers.chain as chain_module
+import aap_transformers.utils as utils_module
 from aap_transformers.chain import ChatCausalMultiTurnsChain
-from aap_transformers.utils import media_ref_to_audio_part, media_ref_to_image_part
+from aap_transformers.utils import (
+    DEFAULT_NUM_FRAMES,
+    media_ref_to_audio_part,
+    media_ref_to_image_part,
+    media_ref_to_video_part,
+)
 
 
 def png_bytes(color: str = "red", size: Tuple[int, int] = (4, 4)) -> bytes:
@@ -44,6 +53,48 @@ PNG_DATA = png_bytes()
 PNG_B64 = base64.b64encode(PNG_DATA).decode("ascii")
 WAV_DATA = wav_bytes()
 WAV_B64 = base64.b64encode(WAV_DATA).decode("ascii")
+
+
+def mp4_bytes(frames: int = 12, size=(32, 32)) -> bytes:
+    """Generate a tiny lossy mp4 whose frame i is uniformly gray i*16.
+
+    Written with cv2 so the fixture needs no binary blobs in the repo; mp4v is
+    lossy, so pixel assertions must allow a tolerance, and index coverage is
+    asserted on _sample_frames-style synthetic data instead.
+    """
+    import cv2
+
+    path = tempfile.mktemp(suffix=".mp4")
+    writer = cv2.VideoWriter(
+        path, cv2.VideoWriter_fourcc(*"mp4v"), 10, size
+    )
+    for i in range(frames):
+        writer.write(np.full((*size[::-1], 3), i * 16 % 256, dtype=np.uint8))
+    writer.release()
+    with open(path, "rb") as handle:
+        data = handle.read()
+    os.remove(path)
+    return data
+
+
+class FakeResponse:
+    """Stand-in for an httpx.Response returned by a stubbed get."""
+
+    def __init__(self, content: bytes, status_code: int = 200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "stubbed failure", request=None, response=self  # type: ignore[arg-type]
+            )
+
+
+@pytest.fixture
+def mp4(tmp_path_factory) -> bytes:
+    """Session-cheap generated mp4 fixture, written once per use."""
+    return mp4_bytes()
 
 
 class FakeInputs(dict):
@@ -85,11 +136,19 @@ class FakeFeatureExtractor:
         self.sampling_rate = sampling_rate
 
 
+class FakeVideoProcessor:
+    """Stand-in for a video processor; its presence marks a video pipeline."""
+
+    def __init__(self, num_frames: int = DEFAULT_NUM_FRAMES):
+        self.num_frames = num_frames
+
+
 class FakeProcessor:
     """Stand-in for AutoProcessor; carries each pipeline only when capable.
 
-    image_processor marks vision, feature_extractor marks audio - exactly the
-    attributes _resolve_capabilities probes on a real processor.
+    image_processor marks vision, feature_extractor marks audio, and
+    video_processor marks video - exactly the attributes
+    _resolve_capabilities probes on a real processor.
     """
 
     def __init__(
@@ -97,13 +156,17 @@ class FakeProcessor:
         tokenizer: Optional[FakeTokenizer] = None,
         vision: bool = True,
         audio: bool = False,
+        video: bool = False,
         sampling_rate: int = 16_000,
+        num_frames: int = DEFAULT_NUM_FRAMES,
     ):
         self.tokenizer = tokenizer if tokenizer is not None else FakeTokenizer()
         if vision:
             self.image_processor = object()
         if audio:
             self.feature_extractor = FakeFeatureExtractor(sampling_rate)
+        if video:
+            self.video_processor = FakeVideoProcessor(num_frames)
         self.calls: List[Tuple[List[Dict[str, Any]], Dict[str, Any]]] = []
 
     def apply_chat_template(self, conversation, **kwargs):
@@ -179,6 +242,11 @@ def image_refs(content: Any) -> List[Dict[str, Any]]:
 def audio_refs(content: Any) -> List[Dict[str, Any]]:
     assert isinstance(content, list), f"expected content parts, got {content!r}"
     return [part for part in content if part.get("type") == "audio"]
+
+
+def video_refs(content: Any) -> List[Dict[str, Any]]:
+    assert isinstance(content, list), f"expected content parts, got {content!r}"
+    return [part for part in content if part.get("type") == "video"]
 
 
 class TestMediaRefToImagePart:
@@ -297,6 +365,124 @@ class TestMediaRefToAudioPart:
         }
         with pytest.raises(ValueError, match="only audio refs"):
             media_ref_to_audio_part(ref)
+
+
+class TestMediaRefToVideoPart:
+    """Video is decoded at our layer: transformers' string loaders need
+    torchcodec/PyAV, which are not guaranteed installs, so unlike image and
+    audio there is no URL passthrough to test -- URLs are fetched here."""
+
+    def test_base64_ref_decodes_to_frame_array(self, mp4):
+        ref: MediaReference = {
+            "content_type": "video",
+            "kind": "base64",
+            "value": base64.b64encode(mp4).decode("ascii"),
+            "mime_type": "video/mp4",
+        }
+        part = media_ref_to_video_part(ref, num_frames=4)
+        assert part["type"] == "video"
+        video = part["video"]
+        assert video.ndim == 4 and video.shape[-1] == 3
+        assert video.dtype == np.uint8
+        assert video.shape[0] <= 4
+
+    def test_url_ref_is_fetched_and_decoded(self, mp4, monkeypatch):
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return FakeResponse(mp4)
+
+        monkeypatch.setattr(utils_module.httpx, "get", fake_get)
+        ref: MediaReference = {
+            "content_type": "video",
+            "kind": "url",
+            "value": "https://example.com/clip.mp4",
+            "mime_type": "video/mp4",
+        }
+        part = media_ref_to_video_part(ref, num_frames=4)
+        assert calls == ["https://example.com/clip.mp4"]
+        assert part["video"].ndim == 4
+
+    def test_failed_url_fetch_raises_value_error(self, monkeypatch):
+        def fake_get(url, **kwargs):
+            return FakeResponse(b"", status_code=404)
+
+        monkeypatch.setattr(utils_module.httpx, "get", fake_get)
+        ref: MediaReference = {
+            "content_type": "video",
+            "kind": "url",
+            "value": "https://example.com/gone.mp4",
+            "mime_type": "video/mp4",
+        }
+        with pytest.raises(ValueError, match="could not be fetched"):
+            media_ref_to_video_part(ref)
+
+    def test_frames_sampled_to_budget(self, mp4):
+        ref: MediaReference = {
+            "content_type": "video",
+            "kind": "base64",
+            "value": base64.b64encode(mp4).decode("ascii"),
+            "mime_type": "video/mp4",
+        }
+        few = media_ref_to_video_part(ref, num_frames=2)["video"]
+        many = media_ref_to_video_part(ref, num_frames=8)["video"]
+        assert few.shape[0] == 2 < many.shape[0]
+
+    def test_uniform_sampling_covers_first_and_last_frame(self):
+        # Index coverage asserted without a codec: synthetic marker frames,
+        # because mp4v is lossy and pixel values cannot be asserted exactly.
+        from aap_transformers.utils import _sample_frames
+
+        frames = [np.full((4, 4, 3), i, np.uint8) for i in range(30)]
+        out = _sample_frames(frames, 8)
+        markers = out[:, 0, 0, 0]
+        assert markers[0] == 0 and markers[-1] == 29
+        assert len(set(markers.tolist())) == 8
+
+    def test_bgr_converted_to_rgb(self, mp4):
+        # A pure-blue BGR source must arrive as RGB [..., 255] modulo codec loss.
+        import cv2
+
+        path = tempfile.mktemp(suffix=".mp4")
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 10, (16, 16))
+        for _ in range(4):
+            writer.write(
+                np.tile(np.array([[[255, 0, 0]]], np.uint8), (16, 16, 1))
+            )
+        writer.release()
+        with open(path, "rb") as handle:
+            data = handle.read()
+        os.remove(path)
+        ref: MediaReference = {
+            "content_type": "video",
+            "kind": "base64",
+            "value": base64.b64encode(data).decode("ascii"),
+            "mime_type": "video/mp4",
+        }
+        video = media_ref_to_video_part(ref, num_frames=2)["video"]
+        assert video[0, 0, 0, 2] > 200  # red channel last => RGB order
+        assert video[0, 0, 0, 0] < 60  # blue channel first
+
+    def test_corrupt_base64_raises_value_error(self):
+        ref: MediaReference = {
+            "content_type": "video",
+            "kind": "base64",
+            "value": base64.b64encode(b"not a video").decode("ascii"),
+            "mime_type": "video/mp4",
+        }
+        with pytest.raises(ValueError, match="could not be decoded"):
+            media_ref_to_video_part(ref)
+
+    def test_non_video_ref_is_refused(self):
+        ref: MediaReference = {
+            "content_type": "audio",
+            "kind": "url",
+            "value": "https://example.com/sound.wav",
+            "mime_type": "audio/wav",
+        }
+        with pytest.raises(ValueError, match="only video refs"):
+            media_ref_to_video_part(ref)
 
 
 class TestPrepareConversationTextOnly:
@@ -494,6 +680,113 @@ class TestPrepareConversationWithAudio:
         assert text_parts == ["listen"], "media repr leaked into the prompt template"
 
 
+class TestPrepareConversationWithVideo:
+    """Video media must become frame-array content parts on the current user message."""
+
+    def video_chain(self, **kwargs) -> ChatCausalMultiTurnsChain:
+        return make_chain(formatter=FakeProcessor(vision=False, video=True), **kwargs)
+
+    def test_base64_video_becomes_array_part(self, mp4):
+        chain = self.video_chain()
+        msg = AgentMessage(
+            query="watch",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content[0] == {"type": "text", "text": "watch"}
+        assert content[1]["type"] == "video"
+        assert isinstance(content[1]["video"], np.ndarray)
+        assert content[1]["video"].ndim == 4
+
+    def test_local_path_video_becomes_array_part(self, tmp_path):
+        f = tmp_path / "clip.mp4"
+        f.write_bytes(mp4_bytes())
+        chain = self.video_chain()
+        msg = AgentMessage(query="see this?", query_media=[("video", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content[1]["type"] == "video"
+        assert isinstance(content[1]["video"], np.ndarray)
+
+    def test_url_video_is_fetched_not_passed_through(self, mp4, monkeypatch):
+        """The one deliberate break from the image/audio URL passthrough:
+        transformers cannot decode string videos without torchcodec/PyAV, so
+        the fetch happens at our layer."""
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return FakeResponse(mp4)
+
+        monkeypatch.setattr(utils_module.httpx, "get", fake_get)
+        chain = self.video_chain()
+        msg = AgentMessage(
+            query="clip?", query_media=[("video", "https://example.com/clip.mp4")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert calls == ["https://example.com/clip.mp4"]
+        assert isinstance(content[1]["video"], np.ndarray)
+
+    def test_processor_num_frames_is_used(self, mp4):
+        chain = make_chain(
+            formatter=FakeProcessor(vision=False, video=True, num_frames=3)
+        )
+        msg = AgentMessage(
+            query="q",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content[1]["video"].shape[0] == 3
+
+    def test_multiple_videos_preserve_order(self, mp4):
+        chain = self.video_chain()
+        b64 = base64.b64encode(mp4).decode()
+        msg = AgentMessage(
+            query="two?",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{b64}"),
+                ("video", f"data:video/mp4;base64,{b64}"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert [part["type"] for part in content] == ["text", "video", "video"]
+
+    def test_media_order_is_text_image_audio_video(self, mp4):
+        chain = make_chain(
+            formatter=FakeProcessor(vision=True, audio=True, video=True)
+        )
+        msg = AgentMessage(
+            query="all?",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}"),
+                ("audio", "https://example.com/sound.wav"),
+                ("image", "https://example.com/cat.png"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert [part["type"] for part in content] == [
+            "text",
+            "image",
+            "audio",
+            "video",
+        ]
+
+    def test_media_never_leaks_into_prompt_text(self, mp4):
+        chain = self.video_chain()
+        msg = AgentMessage(
+            query="watch",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        text_parts = [part["text"] for part in content if part["type"] == "text"]
+        assert text_parts == ["watch"], "media repr leaked into the prompt template"
+
+
 class TestGenerateResponse:
     def test_tokenizer_path_unchanged_for_text_only_processor(self):
         tokenizer = FakeTokenizer()
@@ -541,6 +834,27 @@ class TestGenerateResponse:
         assert tokenizer.calls == []
         assert audio_refs(processor.calls[0][0][1]["content"])
 
+    def test_video_only_processor_routes_to_processor_not_tokenizer(self):
+        """The video pipeline needs the processor exactly like the pixel one."""
+        tokenizer = FakeTokenizer()
+        processor = FakeProcessor(tokenizer=tokenizer, vision=False, video=True)
+        chain = make_chain(formatter=processor)
+        conversation = chain._prepare_conversation(
+            AgentMessage(
+                query="q",
+                query_media=[
+                    (
+                        "video",
+                        f"data:video/mp4;base64,{base64.b64encode(mp4_bytes()).decode()}",
+                    )
+                ],
+            )
+        )
+        chain._generate_response(conversation)
+        assert len(processor.calls) == 1
+        assert tokenizer.calls == []
+        assert video_refs(processor.calls[0][0][1]["content"])
+
     def test_tool_call_detection(self):
         class ToolCallingModel(FakeModel):
             def generate(self, **kwargs):
@@ -561,19 +875,45 @@ class TestGenerateResponse:
 class TestCapabilityDetection:
     def test_vision_processor_is_decisive_true(self):
         chain = make_chain(formatter=FakeProcessor())
-        assert chain.detect_capabilities() == {"image": True, "audio": False}
+        assert chain.detect_capabilities() == {
+            "image": True,
+            "audio": False,
+            "video": False,
+        }
 
     def test_processor_without_image_processor_is_decisive_false(self):
         chain = make_chain(formatter=FakeProcessor(vision=False))
-        assert chain.detect_capabilities() == {"image": False, "audio": False}
+        assert chain.detect_capabilities() == {
+            "image": False,
+            "audio": False,
+            "video": False,
+        }
 
     def test_audio_processor_is_decisive_per_modality(self):
         chain = make_chain(formatter=FakeProcessor(vision=False, audio=True))
-        assert chain.detect_capabilities() == {"image": False, "audio": True}
+        assert chain.detect_capabilities() == {
+            "image": False,
+            "audio": True,
+            "video": False,
+        }
 
-    def test_omni_processor_reports_both_true(self):
-        chain = make_chain(formatter=FakeProcessor(vision=True, audio=True))
-        assert chain.detect_capabilities() == {"image": True, "audio": True}
+    def test_video_processor_is_decisive_per_modality(self):
+        chain = make_chain(formatter=FakeProcessor(vision=False, video=True))
+        assert chain.detect_capabilities() == {
+            "image": False,
+            "audio": False,
+            "video": True,
+        }
+
+    def test_omni_processor_reports_all_true(self):
+        chain = make_chain(
+            formatter=FakeProcessor(vision=True, audio=True, video=True)
+        )
+        assert chain.detect_capabilities() == {
+            "image": True,
+            "audio": True,
+            "video": True,
+        }
 
     def test_plain_tokenizer_without_repo_id_is_undecidable(self):
         chain = make_chain(formatter=FakeTokenizer(name_or_path="local-weights"))
@@ -614,7 +954,11 @@ class TestCapabilityDetection:
         chain = make_chain(
             formatter=FakeProcessor(tokenizer=FakeTokenizer(name_or_path="org/repo"))
         )
-        assert chain.detect_capabilities() == {"image": True, "audio": False}
+        assert chain.detect_capabilities() == {
+            "image": True,
+            "audio": False,
+            "video": False,
+        }
         assert hf.calls == []
 
     def test_capabilities_are_cached(self, hf):
@@ -638,7 +982,11 @@ class TestCapabilityDetection:
         formatter, model = chain.model
         chain.model = (formatter, model)
         assert chain._processor is processor
-        assert chain.detect_capabilities() == {"image": True, "audio": False}
+        assert chain.detect_capabilities() == {
+            "image": True,
+            "audio": False,
+            "video": False,
+        }
 
 
 class TestMediaGate:
@@ -714,6 +1062,47 @@ class TestMediaGate:
         content = user_message_of(chain._prepare_conversation(msg))["content"]
         assert len(audio_refs(content)) == 1
 
+    def test_incapable_model_drops_video_with_warning(self, caplog, mp4):
+        chain = make_chain(formatter=FakeProcessor())  # vision-only: video False
+        msg = AgentMessage(
+            query="clip?",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content == "clip?"
+        assert "does not support video" in caplog.text
+
+    def test_disabled_policy_overrides_video_processor(self, mp4):
+        chain = make_chain(
+            formatter=FakeProcessor(vision=False, video=True),
+            media_support={"video": "disabled"},
+        )
+        msg = AgentMessage(
+            query="clip?",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert content == "clip?"
+
+    def test_enabled_policy_overrides_decisive_video_negative(self, mp4):
+        chain = make_chain(
+            formatter=FakeProcessor(),  # vision processor: video decisively False
+            media_support={"video": "enabled"},
+        )
+        msg = AgentMessage(
+            query="clip?",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg))["content"]
+        assert len(video_refs(content)) == 1
+
 
 class TestInvokeEndToEnd:
     def test_invoke_with_image_delivers_parts_and_records_usage(self):
@@ -773,6 +1162,22 @@ class TestInvokeEndToEnd:
         content = processor.calls[0][0][1]["content"]
         assert not image_refs(content)
         assert len(audio_refs(content)) == 1
+
+    def test_invoke_with_video_delivers_parts_and_records_usage(self, mp4):
+        processor = FakeProcessor(vision=False, video=True)
+        model = FakeModel()
+        chain = make_chain(formatter=processor, model=model)
+        msg = AgentMessage(
+            query="what happens?",
+            query_media=[
+                ("video", f"data:video/mp4;base64,{base64.b64encode(mp4).decode()}")
+            ],
+        )
+        result = chain(msg)
+        assert result.responses == [(chain.name, "answer")]
+        assert result.execution_result == "success"
+        assert len(processor.calls) == 1
+        assert video_refs(processor.calls[0][0][1]["content"])
 
     def test_query_media_untouched_on_message(self):
         chain = make_chain()

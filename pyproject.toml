@@ -21,6 +21,14 @@ dependencies = [
     # These two are what transformers.audio_utils itself uses internally.
     "soundfile>=0.12.1",
     "soxr>=0.4",
+    # Video input: frames are decoded/sampled at our layer because
+    # transformers' string-video loaders need torchcodec or PyAV, neither of
+    # which ships guaranteed wheels here (Jetson/aarch64). opencv-python
+    # bundles FFmpeg decoding in its wheels; headless avoids the GUI deps.
+    "opencv-python-headless>=4.10",
+    # Video URL refs are fetched here before decoding, same as transformers'
+    # own loaders do (transitive via transformers; declared because we import it).
+    "httpx>=0.27",
 ]
 classifiers = [
     "Programming Language :: Python :: 3.10",
