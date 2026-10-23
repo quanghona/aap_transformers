@@ -1,0 +1,197 @@
+name: Build test and deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  # Called by publish_pypi.yml. There is no cross-workflow `needs` in GitHub
+  # Actions, so reusing the validate/build jobs for a release gate has to go
+  # through workflow_call rather than a job reference. Renaming or removing
+  # this trigger breaks the release workflow.
+  workflow_call:
+    inputs:
+      gate_only:
+        description: >-
+          Run only Lint/Test/Scan and Build, skipping the TestPyPI deploy and
+          its smoke test. Set by publish_pypi.yml, which publishes to real PyPI
+          and must not touch TestPyPI on the release path.
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: "3.10" # minimum supported version
+
+jobs:
+  validate:
+    name: Lint, Test and Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # CodeQL SARIF upload
+    steps:
+      # ---------- 1. Environment ----------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --no-sources is required, not defensive: [tool.uv.sources] pins torch
+        # to an absolute aarch64 wheel path (/data/install/...) that does not
+        # exist on x86_64 runners, and aap-core to the explicit test-pypi index.
+        # Ignoring sources makes both resolve from PyPI (aap-core>=0.1.0).
+        # Note uv sync does NOT re-resolve: the committed uv.lock is the source
+        # of truth, so keep its aap-core pin current (>=0.3.0) when the code
+        # starts using newer aap_core modules.
+        # --no-group dev: the dev group pulls vllm (multi-GB, pins its own
+        # torch) and ipykernel; neither is imported by src/ or tests/, only by
+        # notebooks. pytest lives ONLY in dev, so the test step below adds it
+        # ephemerally -- do not "simplify" that step, it would otherwise
+        # re-sync dev (and vllm) back in.
+        run: uv sync --no-sources --no-group dev
+
+      # ---------- 2. Lint ----------
+      # No `lint` dependency-group is defined in this repo's pyproject.toml,
+      # so ruff runs via uvx (ephemeral env) pinned to the same version as
+      # aap_core for deterministic results.
+      - name: Ruff check
+        run: uvx ruff@0.14.0 check .
+
+      - name: Ruff format check
+        run: uvx ruff@0.14.0 format --check .
+
+      # ---------- 3. Tests ----------
+      # Offline suite: test_chain.py builds chains from fake (formatter, model)
+      # tuples so no from_pretrained/GPU/model download happens, stubs the
+      # Hugging Face lookup via an autouse fixture, and stubs httpx for URL
+      # fetches. No API keys or external services are required.
+      # --no-group dev keeps the vllm exclusion from the sync step: `uv run`
+      # implicitly re-syncs with the DEFAULT groups (dev included) before
+      # executing, so omitting the flag silently installs multi-GB vllm here.
+      # --with pytest covers the one dev package the suite actually needs;
+      # it is ephemeral, so it never reaches the published metadata.
+      - name: Run tests
+        run: uv run --no-group dev --with "pytest>=9.0.3" pytest tests -v
+
+      # ---------- 4. CodeQL security scan ----------
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # ---------- 5. Build ----------
+      - name: Build package
+        run: uv build
+
+      - name: Upload dist artifacts
+        # Consumed by publish_pypi.yml when this workflow runs as a reusable
+        # call: artifacts are scoped to the whole run, so the release job
+        # downloads this one by name. Do not rename it casually.
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  deploy-test:
+    name: Deploy to TestPyPI
+    runs-on: ubuntu-latest
+    needs: build
+    # `!= true` rather than `!inputs.gate_only`: on a push trigger the inputs
+    # context is empty, and comparing against true keeps that path running.
+    # When this job is skipped, test-pypi skips too via its `needs`.
+    if: ${{ inputs.gate_only != true }}
+    permissions:
+      id-token: write # mandatory for OIDC trusted publishing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # ---------- 6. Test PyPI ----------
+      # Trusted publishing (OIDC): no password. Setting a password would force
+      # token auth and silently bypass the trusted publisher configured on TestPyPI.
+      # skip-existing is intentional here: PyPI/TestPyPI reject a filename that was
+      # already uploaded, so re-running CI on an unchanged version must not fail.
+      # Keep it OFF for the real PyPI job so genuine duplicates fail loudly.
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  test-pypi:
+    name: Test TestPyPI package
+    runs-on: ubuntu-latest
+    needs: deploy-test
+    steps:
+      - name: Wait for TestPyPI propagation
+        run: sleep 30
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Test package installation and import
+        # Installs WITH dependencies: aap_transformers' submodules import
+        # transformers/torch at module level and aap_core, whose __init__
+        # imports policy_trainer (torch/wandb) -- so a --no-deps install
+        # cannot be imported at all. triton is a declared dependency with
+        # Linux-only wheels; the ubuntu runner satisfies it.
+        # --index-url stays PyPI (the default) with TestPyPI as --extra-index-url:
+        # uv's default first-match strategy serves the pinned aap-transformers
+        # version from TestPyPI while its dependencies (aap-core, transformers,
+        # torch, ...) resolve from PyPI, which mirrors them and TestPyPI does
+        # not. The inverse (--index-url test.pypi.org) fails outright because
+        # TestPyPI hosts no aap-core. Pinning the exact version keeps the
+        # fallback honest: if the TestPyPI upload did not land, the install
+        # fails instead of silently passing off the PyPI copy as the new build.
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          uv venv /tmp/smoke --python "$PYTHON_VERSION"
+          uv pip install --python /tmp/smoke \
+            --extra-index-url https://test.pypi.org/simple/ \
+            "aap-transformers==${VERSION}"
+          # Assert the package exposes __version__ and it matches pyproject.toml.
+          /tmp/smoke/bin/python -c "import aap_transformers; assert aap_transformers.__version__ == '${VERSION}', aap_transformers.__version__; print('aap_transformers', aap_transformers.__version__)"

@@ -1,0 +1,146 @@
+name: Publish to PyPI
+
+# Manual-only release pipeline. Preconditions are not duplicated here: ci.yml is
+# invoked as a reusable workflow, so the gate always runs on this commit.
+#
+# Prerequisite (one-time, outside this file): on PyPI, add a trusted publisher
+# for project `aap-transformers` with owner `quanghona`, repository
+# `aap_transformers`, and workflow name `publish_pypi.yml`. The workflow
+# filename is part of the OIDC claim, so renaming this file breaks publishing.
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.10" # minimum supported version
+
+jobs:
+  # ---------- Conditions 1 + 2: reuse ci.yml's validate and build jobs ----------
+  # ci.yml is invoked as a reusable workflow against THIS commit, so a green gate
+  # always means this revision passed lint, tests, the security scan and the
+  # build. Gating on some other run's status would let untested code reach PyPI.
+  # gate_only suppresses ci.yml's TestPyPI leg: a release must not republish to
+  # TestPyPI or block on its smoke test. The dist artifact is still produced by
+  # ci.yml's build job and is run-scoped, so publish downloads it below.
+  ci:
+    name: CI gate (lint, test, scan, build)
+    uses: ./.github/workflows/ci.yml
+    with:
+      gate_only: true
+    permissions:
+      contents: read
+      # A called workflow's job permissions are silently capped to what the
+      # caller grants, so this must cover everything ci.yml needs on the gated
+      # path: the CodeQL SARIF upload. If the gate ever needs OIDC (e.g.
+      # gate_only is dropped so deploy-test runs), add id-token: write here or
+      # that job fails with an opaque auth error rather than a clear denial.
+      security-events: write
+
+  # ---------- Job 1: publish to PyPI + tag ----------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: ci
+    permissions:
+      contents: write # push the release tag
+      id-token: write # mandatory for OIDC trusted publishing
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from pyproject.toml
+        id: meta
+        # ci.yml exposes no version output, so the release job derives it from
+        # the same source of truth it publishes. tomllib is unavailable here:
+        # it landed in 3.11 and PYTHON_VERSION is pinned to the 3.10 floor.
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ -z "${VERSION}" ]; then echo "::error::Could not read project.version from pyproject.toml"; exit 1; fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+
+      - name: Guard against a stale or conflicting tag
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        # A tag that already exists but points elsewhere means two different
+        # commits claim the same release version. Publishing either one would
+        # make the tag lie about its contents.
+        run: |
+          TAG="v${VERSION}"
+          RAW=$(git ls-remote origin "refs/tags/${TAG}")
+          # Prefer the peeled (^{}) entry: for an annotated tag the plain line is
+          # the tag-object SHA, which never equals a commit SHA and would make
+          # every later release of the same version fail this guard.
+          EXISTING=$(printf '%s\n' "${RAW}" | awk '$2 ~ /\^\{\}$/{print $1}')
+          if [ -z "${EXISTING}" ]; then
+            # Explicit if, not `[ -z ] && x=`: the runner shell runs with -e and
+            # a short-circuit that evaluates false aborts the step.
+            EXISTING=$(printf '%s\n' "${RAW}" | awk 'NR==1{print $1}')
+          fi
+          if [ -n "${EXISTING}" ] && [ "${EXISTING}" != "${GITHUB_SHA}" ]; then
+            echo "::error::Tag ${TAG} already points at ${EXISTING}, not ${GITHUB_SHA}. Bump the version or publish from the tagged commit."
+            exit 1
+          fi
+          echo "existing_tag=${EXISTING:-}" >> "$GITHUB_ENV"
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Trusted publishing (OIDC): no password, no skip-existing. A duplicate
+      # on real PyPI must fail loudly, unlike the TestPyPI path in ci.yml.
+      # Note: aap-transformers 0.2.0 already exists on PyPI, so releasing from a
+      # commit whose pyproject.toml still says 0.2.0 fails here by design —
+      # bump the version first.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      # Tag AFTER a successful upload so a tag implies a live release. If this
+      # step alone fails, re-running the workflow is safe: PyPI rejects the
+      # duplicate and the tag guard above is idempotent.
+      - name: Tag the release
+        if: env.existing_tag == ''
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${VERSION}" "${GITHUB_SHA}"
+          git push origin "v${VERSION}"
+
+  # ---------- Job 2: smoke-test the published distribution ----------
+  test-pypi:
+    name: Test PyPI package
+    runs-on: ubuntu-latest
+    needs: publish
+    env:
+      VERSION: ${{ needs.publish.outputs.version }}
+    steps:
+      - name: Wait for PyPI propagation
+        run: sleep 30
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Test package installation and import
+        # Installs WITH dependencies, plain PyPI (no extra indexes):
+        # aap_transformers' submodules import transformers/torch and aap_core
+        # at module level, whose __init__ imports policy_trainer (torch/wandb)
+        # — so a --no-deps install cannot be imported at all. Everything in
+        # the dependency closure (transformers, accelerate, triton, torch,
+        # opencv-python-headless, ...) is on PyPI for the Linux runner, unlike
+        # the TestPyPI leg in ci.yml.
+        run: |
+          uv venv /tmp/smoke --python "$PYTHON_VERSION"
+          uv pip install --python /tmp/smoke "aap-transformers==${VERSION}"
+          /tmp/smoke/bin/python -c "import aap_transformers; assert aap_transformers.__version__ == '${VERSION}', aap_transformers.__version__; print('aap_transformers', aap_transformers.__version__)"
