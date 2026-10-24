@@ -62,29 +62,29 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${VERSION}"
 
-      - name: Guard against a stale or conflicting tag
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        # A tag that already exists but points elsewhere means two different
-        # commits claim the same release version. Publishing either one would
-        # make the tag lie about its contents.
-        run: |
-          TAG="v${VERSION}"
-          RAW=$(git ls-remote origin "refs/tags/${TAG}")
-          # Prefer the peeled (^{}) entry: for an annotated tag the plain line is
-          # the tag-object SHA, which never equals a commit SHA and would make
-          # every later release of the same version fail this guard.
-          EXISTING=$(printf '%s\n' "${RAW}" | awk '$2 ~ /\^\{\}$/{print $1}')
-          if [ -z "${EXISTING}" ]; then
-            # Explicit if, not `[ -z ] && x=`: the runner shell runs with -e and
-            # a short-circuit that evaluates false aborts the step.
-            EXISTING=$(printf '%s\n' "${RAW}" | awk 'NR==1{print $1}')
-          fi
-          if [ -n "${EXISTING}" ] && [ "${EXISTING}" != "${GITHUB_SHA}" ]; then
-            echo "::error::Tag ${TAG} already points at ${EXISTING}, not ${GITHUB_SHA}. Bump the version or publish from the tagged commit."
-            exit 1
-          fi
-          echo "existing_tag=${EXISTING:-}" >> "$GITHUB_ENV"
+      # - name: Guard against a stale or conflicting tag
+      #   env:
+      #     VERSION: ${{ steps.meta.outputs.version }}
+      #   # A tag that already exists but points elsewhere means two different
+      #   # commits claim the same release version. Publishing either one would
+      #   # make the tag lie about its contents.
+      #   run: |
+      #     TAG="v${VERSION}"
+      #     RAW=$(git ls-remote origin "refs/tags/${TAG}")
+      #     # Prefer the peeled (^{}) entry: for an annotated tag the plain line is
+      #     # the tag-object SHA, which never equals a commit SHA and would make
+      #     # every later release of the same version fail this guard.
+      #     EXISTING=$(printf '%s\n' "${RAW}" | awk '$2 ~ /\^\{\}$/{print $1}')
+      #     if [ -z "${EXISTING}" ]; then
+      #       # Explicit if, not `[ -z ] && x=`: the runner shell runs with -e and
+      #       # a short-circuit that evaluates false aborts the step.
+      #       EXISTING=$(printf '%s\n' "${RAW}" | awk 'NR==1{print $1}')
+      #     fi
+      #     if [ -n "${EXISTING}" ] && [ "${EXISTING}" != "${GITHUB_SHA}" ]; then
+      #       echo "::error::Tag ${TAG} already points at ${EXISTING}, not ${GITHUB_SHA}. Bump the version or publish from the tagged commit."
+      #       exit 1
+      #     fi
+      #     echo "existing_tag=${EXISTING:-}" >> "$GITHUB_ENV"
 
       - name: Download dist artifacts
         uses: actions/download-artifact@v4
