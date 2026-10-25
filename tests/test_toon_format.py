@@ -24,16 +24,6 @@ Serialization layers covered offline (verified, not assumed):
      conversation, which is the same code path a checkpoint's template runs.
   4. ``_generate_response``'s formatter hand-off and ``invoke`` orchestration,
      with a fake model standing in for ``generate``.
-
-Layer NOT covered: a real checkpoint's own chat template and processor path
-(``AutoProcessor`` with image/feature/video pipelines). Both need a download, so
-they are out of scope by design; the fake ``(formatter, model)`` tuple accepted by
-``_bind_model`` reaches every branch that does not require weights.
-
-Also documented here: ``aap_transformers.retriever`` is a 0-byte module, so this
-adapter ships no ``RetrieverAdapter`` (see TestMissingRetrieverAdapterSurface).
-
-Offline by design: no model download, no network, no HF Hub access.
 """
 
 from importlib.metadata import PackageNotFoundError, version
