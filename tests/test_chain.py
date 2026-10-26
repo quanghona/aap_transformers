@@ -65,9 +65,7 @@ def mp4_bytes(frames: int = 12, size=(32, 32)) -> bytes:
     import cv2
 
     path = tempfile.mktemp(suffix=".mp4")
-    writer = cv2.VideoWriter(
-        path, cv2.VideoWriter_fourcc(*"mp4v"), 10, size
-    )
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 10, size)
     for i in range(frames):
         writer.write(np.full((*size[::-1], 3), i * 16 % 256, dtype=np.uint8))
     writer.release()
@@ -87,7 +85,9 @@ class FakeResponse:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise httpx.HTTPStatusError(
-                "stubbed failure", request=None, response=self  # type: ignore[arg-type]
+                "stubbed failure",
+                request=None,
+                response=self,  # type: ignore[arg-type]
             )
 
 
@@ -447,9 +447,7 @@ class TestMediaRefToVideoPart:
         path = tempfile.mktemp(suffix=".mp4")
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 10, (16, 16))
         for _ in range(4):
-            writer.write(
-                np.tile(np.array([[[255, 0, 0]]], np.uint8), (16, 16, 1))
-            )
+            writer.write(np.tile(np.array([[[255, 0, 0]]], np.uint8), (16, 16, 1)))
         writer.release()
         with open(path, "rb") as handle:
             data = handle.read()
@@ -755,9 +753,7 @@ class TestPrepareConversationWithVideo:
         assert [part["type"] for part in content] == ["text", "video", "video"]
 
     def test_media_order_is_text_image_audio_video(self, mp4):
-        chain = make_chain(
-            formatter=FakeProcessor(vision=True, audio=True, video=True)
-        )
+        chain = make_chain(formatter=FakeProcessor(vision=True, audio=True, video=True))
         msg = AgentMessage(
             query="all?",
             query_media=[
@@ -906,9 +902,7 @@ class TestCapabilityDetection:
         }
 
     def test_omni_processor_reports_all_true(self):
-        chain = make_chain(
-            formatter=FakeProcessor(vision=True, audio=True, video=True)
-        )
+        chain = make_chain(formatter=FakeProcessor(vision=True, audio=True, video=True))
         assert chain.detect_capabilities() == {
             "image": True,
             "audio": True,
