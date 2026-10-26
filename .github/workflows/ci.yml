@@ -179,18 +179,20 @@ jobs:
         # imports policy_trainer (torch/wandb) -- so a --no-deps install
         # cannot be imported at all. triton is a declared dependency with
         # Linux-only wheels; the ubuntu runner satisfies it.
-        # --index-url stays PyPI (the default) with TestPyPI as --extra-index-url:
-        # uv's default first-match strategy serves the pinned aap-transformers
-        # version from TestPyPI while its dependencies (aap-core, transformers,
-        # torch, ...) resolve from PyPI, which mirrors them and TestPyPI does
-        # not. The inverse (--index-url test.pypi.org) fails outright because
-        # TestPyPI hosts no aap-core. Pinning the exact version keeps the
-        # fallback honest: if the TestPyPI upload did not land, the install
-        # fails instead of silently passing off the PyPI copy as the new build.
+        # PyPI stays the default index; TestPyPI is an extra. --index-strategy
+        # unsafe-best-match is REQUIRED: uv's default first-index strategy clamps
+        # each package to the first index containing its NAME, and TestPyPI hosts
+        # stale squats (a2a-sdk==0.2.0a1) plus partial mirrors (aap-core), so
+        # under first-index either the deps or the newer aap-core would fail to
+        # resolve. With best-match the exact-pinned aap-transformers comes from
+        # TestPyPI while deps (a2a-sdk, torch, ...) resolve from PyPI. Pinning
+        # the exact version keeps the smoke test honest: if the TestPyPI upload
+        # did not land, the install fails instead of passing off an older copy.
         run: |
           VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
           uv venv /tmp/smoke --python "$PYTHON_VERSION"
           uv pip install --python /tmp/smoke \
+            --index-strategy unsafe-best-match \
             --extra-index-url https://test.pypi.org/simple/ \
             "aap-transformers==${VERSION}"
           # Assert the package exposes __version__ and it matches pyproject.toml.
